@@ -63,7 +63,13 @@ jobs:
       - name: Videoyu üret
         if: github.event_name == 'repository_dispatch'
         env:
-          # Boşsa ücretsiz Piper sesi kullanılır
+          # sessiz = seslendirme yok, yazılar ekranda akar + hafif fon sesi (FON: "0" yaparsan tam sessiz)
+          # Seslendirme istersen bu satırı "otomatik" yap: Azure (varsa) → Google (varsa) → ücretsiz Piper
+          SESLENDIRME: sessiz
+          FON: "1"
+          AZURE_TTS_KEY: ${{ secrets.AZURE_TTS_KEY }}
+          AZURE_TTS_REGION: ${{ secrets.AZURE_TTS_REGION }}
+          AZURE_SES: tr-TR-AhmetNeural
           GCP_TTS_KEY: ${{ secrets.GCP_TTS_KEY }}
           PIPER_DIR: ${{ runner.temp }}/piper
           PIPER_SES: tr_TR-fahrettin-medium
