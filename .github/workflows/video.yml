@@ -45,10 +45,28 @@ jobs:
             git reset -q
           fi
 
+      # Ücretsiz seslendirme (Piper, açık kaynak). GCP_TTS_KEY eklenirse Google sesi kullanılır.
+      - uses: actions/cache@v4
+        if: github.event_name == 'repository_dispatch'
+        with:
+          path: ${{ runner.temp }}/piper
+          key: piper-2023.11.14-2-v1
+
+      - name: Ücretsiz ses (Piper)
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          if [ ! -x "$RUNNER_TEMP/piper/piper" ]; then
+            curl -sSfL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz | tar xz -C "$RUNNER_TEMP"
+          fi
+          "$RUNNER_TEMP/piper/piper" --help > /dev/null 2>&1 && echo "Piper hazır"
+
       - name: Videoyu üret
         if: github.event_name == 'repository_dispatch'
         env:
+          # Boşsa ücretsiz Piper sesi kullanılır
           GCP_TTS_KEY: ${{ secrets.GCP_TTS_KEY }}
+          PIPER_DIR: ${{ runner.temp }}/piper
+          PIPER_SES: tr_TR-fahrettin-medium
           # Yalnızca senin bota gönderdiğin videoyu indirmek için (Telegram bot anahtarı)
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           YAZI_KLASORU: ${{ github.workspace }}/yazi
