@@ -16,7 +16,12 @@ Girdi: GitHub repository_dispatch ile gelen JSON (payload.json).
   <id>.jpg   kapak
   <id>.json  {"ok": true, "sure": 27.4, ...}  ya da  {"ok": false, "hata": "..."}
 
-Seslendirme:
+SESLENDIRME=sessiz ise seslendirme yapılmaz: cümleler okuma hızına göre ekranda akar,
+  altta telifsiz, programla üretilmiş hafif bir fon sesi çalar (FON=0 ise tam sessiz).
+Seslendirme (ilk bulunan kullanılır):
+  AZURE_TTS_KEY varsa Microsoft Azure Speech (ücretsiz F0 paketi: ayda 500 bin karakter, doğal sinirsel ses).
+    AZURE_TTS_REGION : Azure kaynağının bölgesi (örn. westeurope)
+    AZURE_SES        : ses adı (varsayılan tr-TR-AhmetNeural; kadın: tr-TR-EmelNeural)
   GCP_TTS_KEY varsa Google Cloud Text-to-Speech (SSML <mark> ile cümle zamanları).
   Yoksa ücretsiz, açık kaynak Piper (GitHub sunucusunda çalışır; kart, hesap, ödeme istemez).
     PIPER_DIR : piper programının klasörü (iş akışı indirir)
@@ -81,7 +86,71 @@ PIPER_ARA = 0.28        # cümleler arası sessizlik (sn)
 def motor():
     if os.environ.get('TEST_SES') == '1':
         return 'test'
+    if (os.environ.get('SESLENDIRME') or '').strip().lower() in ('sessiz', 'kapali', 'kapalı', 'yok'):
+        return 'sessiz'
+    if os.environ.get('AZURE_TTS_KEY'):
+        return 'azure'
     return 'google' if os.environ.get('GCP_TTS_KEY') else 'piper'
+
+
+def parcalari_birlestir(parcalar, yol):
+    """Cümle seslerini arada kısa sessizlikle birleştirir, sesi dengeler (48 kHz stereo WAV)."""
+    girdiler, filtre = [], ''
+    for i, p in enumerate(parcalar):
+        girdiler += ['-i', p]
+        filtre += '[%d:a]aresample=48000,apad=pad_dur=%.2f[a%d];' % (i, PIPER_ARA, i)
+    filtre += ''.join('[a%d]' % i for i in range(len(parcalar))) + 'concat=n=%d:v=0:a=1,loudnorm=I=-16:TP=-1.5:LRA=11[s]' % len(parcalar)
+    calistir(['ffmpeg', '-y', '-v', 'error'] + girdiler + ['-filter_complex', filtre, '-map', '[s]',
+              '-ar', '48000', '-ac', '2', '-c:a', 'pcm_s16le', yol])
+
+
+def azure_seslendir(cumleler, hiz, yol):
+    """Microsoft Azure Speech REST: her cümle ayrı okunur, zamanlar kesin bilinir."""
+    anahtar = os.environ['AZURE_TTS_KEY'].strip()
+    bolge = (os.environ.get('AZURE_TTS_REGION') or 'westeurope').strip().lower().replace(' ', '')
+    ses = (os.environ.get('AZURE_SES') or 'tr-TR-AhmetNeural').strip()
+    oran = '%+d%%' % round((hiz - 1.0) * 100)
+    url = 'https://%s.tts.speech.microsoft.com/cognitiveservices/v1' % bolge
+    klasor = os.path.dirname(os.path.abspath(yol))
+    parcalar, baslar, t = [], [], 0.0
+    for i, c in enumerate(cumleler):
+        govde = ('<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="tr-TR">'
+                 '<voice name="%s"><prosody rate="%s">%s</prosody></voice></speak>') % (
+                     html.escape(ses), oran, html.escape(c.strip(), quote=False))
+        p = os.path.join(klasor, 'z%02d.wav' % i)
+        son = None
+        for deneme in range(4):
+            istek = urllib.request.Request(url, data=govde.encode('utf-8'), headers={
+                'Ocp-Apim-Subscription-Key': anahtar,
+                'Content-Type': 'application/ssml+xml',
+                'X-Microsoft-OutputFormat': 'riff-48khz-16bit-mono-pcm',
+                'User-Agent': 'MansetMasasi'})
+            try:
+                with urllib.request.urlopen(istek, timeout=60) as y, open(p, 'wb') as f:
+                    f.write(y.read())
+                son = None
+                break
+            except urllib.error.HTTPError as e:
+                son = 'Azure seslendirme hatası %s: %s' % (e.code, e.read().decode('utf-8', 'ignore')[:200])
+                if e.code == 401:
+                    son += ' (anahtar ya da bölge yanlış: AZURE_TTS_KEY / AZURE_TTS_REGION)'
+                    break
+                if e.code in (429, 500, 502, 503):
+                    time.sleep(4 * (deneme + 1))
+                    continue
+                break
+            except Exception as e:  # noqa: BLE001
+                son = 'Azure seslendirmeye bağlanılamadı: %s' % e
+                time.sleep(3)
+        if son:
+            raise RuntimeError(son)
+        if not os.path.exists(p) or os.path.getsize(p) < 1000:
+            raise RuntimeError('Azure boş ses döndürdü (ses adı doğru mu? %s)' % ses)
+        baslar.append(round(t, 3))
+        t += sure(p) + PIPER_ARA
+        parcalar.append(p)
+    parcalari_birlestir(parcalar, yol)
+    return baslar
 
 
 def piper_model(klasor, ad):
@@ -143,18 +212,44 @@ def piper_seslendir(cumleler, hiz, yol):
         baslar.append(round(t, 3))
         t += sure(p) + PIPER_ARA
         parcalar.append(p)
-    girdiler, filtre = [], ''
-    for i, p in enumerate(parcalar):
-        girdiler += ['-i', p]
-        filtre += '[%d:a]aresample=48000,apad=pad_dur=%.2f[a%d];' % (i, PIPER_ARA, i)
-    filtre += ''.join('[a%d]' % i for i in range(len(parcalar))) + 'concat=n=%d:v=0:a=1,loudnorm=I=-16:TP=-1.5:LRA=11[s]' % len(parcalar)
-    calistir(['ffmpeg', '-y', '-v', 'error'] + girdiler + ['-filter_complex', filtre, '-map', '[s]',
+    parcalari_birlestir(parcalar, yol)
+    return baslar
+
+
+def okuma_suresi(cumle):
+    """Bir cümlenin ekranda rahat okunması için gereken süre (sn): ~2,6 kelime/sn, en az 2,4 sn."""
+    return max(2.4, len(cumle.split()) * 0.40 + 0.7)
+
+
+def sessiz_ses(cumleler, yol):
+    """Seslendirmesiz video: cümle zamanlarını okuma hızından çıkarır, hafif bir fon sesi üretir."""
+    baslar, t = [], 0.4
+    for c in cumleler:
+        baslar.append(round(t, 3))
+        t += okuma_suresi(c)
+    toplam = t + 0.3
+    if os.environ.get('FON', '1') == '0':
+        calistir(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '%.2f' % toplam, yol])
+        return baslar
+    # Telifsiz: tamamen formülle üretilen yumuşak bir akor (La minör), yavaş dalgalanır.
+    ifade = ('0.10*sin(2*PI*110*t)*(0.65+0.35*sin(2*PI*0.11*t))'
+             '+0.07*sin(2*PI*164.81*t)*(0.6+0.4*sin(2*PI*0.07*t+1))'
+             '+0.06*sin(2*PI*220*t)*(0.6+0.4*sin(2*PI*0.09*t+2))'
+             '+0.035*sin(2*PI*261.63*t)*(0.5+0.5*sin(2*PI*0.05*t+0.5))'
+             '+0.025*sin(2*PI*329.63*t)*(0.5+0.5*sin(2*PI*0.06*t+3))')
+    calistir(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi',
+              '-i', "aevalsrc='%s':s=48000:d=%.2f" % (ifade, toplam),
+              '-af', 'lowpass=f=900,afade=t=in:d=1.5,afade=t=out:st=%.2f:d=2,volume=0.55' % max(0.1, toplam - 2),
               '-ar', '48000', '-ac', '2', '-c:a', 'pcm_s16le', yol])
     return baslar
 
 
 def seslendir(cumleler, ses, hiz, yol):
     """WAV üretir; her cümlenin başlangıç saniyesini döndürür (bilinmiyorsa None)."""
+    if motor() == 'sessiz':
+        return sessiz_ses(cumleler, yol)
+    if motor() == 'azure':
+        return azure_seslendir(cumleler, hiz, yol)
     if motor() == 'piper':
         return piper_seslendir(cumleler, hiz, yol)
     if motor() == 'test':
@@ -306,10 +401,11 @@ def uret(p, klasor, cikti_klasor):
 
     # İsteğe bağlı: Pexels'ten habere uygun temsilî arka plan görüntüleri (yoksa düz lacivert zemin)
     zemin = arka_plan(p.get('arkaplan') or [], sinirlar, toplam, klasor)
-    not_metni = 'Seslendirme: yapay zekâ · Kaynaklar açıklamada'
+    ses_notu = '' if motor() == 'sessiz' else ' · Seslendirme: yapay zekâ'
+    not_metni = 'Kaynaklar açıklamada' + ses_notu
     if zemin:
         kredi = [k for k in (p.get('kredi') or []) if k][:2]
-        not_metni = 'Temsilî görüntü: Pexels' + (' / ' + ', '.join(kredi) if kredi else '') + ' · Seslendirme: yapay zekâ'
+        not_metni = 'Temsilî görüntü: Pexels' + (' / ' + ', '.join(kredi) if kredi else '') + ses_notu
 
     ass = os.path.join(klasor, 'altyazi.ass')
     ass_yaz(ass, cumleler, baslar, toplam, str(p.get('kanal') or ''), str(p.get('kategori') or 'gündem'), not_metni)
@@ -345,7 +441,7 @@ def uret(p, klasor, cikti_klasor):
     return {'ok': True, 'id': vid, 'sure': toplam, 'boyut': boyut, 'cumle': len(cumleler),
             # Google ücretli olabilir → karakter sayılır; Piper ücretsiz → 0 (panel harcama yazmaz)
             'karakter': sum(len(c) for c in cumleler) if motor() == 'google' else 0, 'zaman': int(time.time()),
-            'zamanlama': {'google': 'tts', 'piper': 'piper'}.get(motor(), 'test'), 'motor': motor(),
+            'zamanlama': {'google': 'tts', 'piper': 'piper', 'azure': 'azure', 'sessiz': 'okuma'}.get(motor(), 'test'), 'motor': motor(),
             'arkaplan': bool(zemin)}
 
 
