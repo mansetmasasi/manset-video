@@ -16,7 +16,11 @@ Girdi: GitHub repository_dispatch ile gelen JSON (payload.json).
   <id>.jpg   kapak
   <id>.json  {"ok": true, "sure": 27.4, ...}  ya da  {"ok": false, "hata": "..."}
 
-Seslendirme: GCP_TTS_KEY ortam değişkeni varsa Google Cloud Text-to-Speech (SSML <mark> ile cümle zamanları).
+Seslendirme:
+  GCP_TTS_KEY varsa Google Cloud Text-to-Speech (SSML <mark> ile cümle zamanları).
+  Yoksa ücretsiz, açık kaynak Piper (GitHub sunucusunda çalışır; kart, hesap, ödeme istemez).
+    PIPER_DIR : piper programının klasörü (iş akışı indirir)
+    PIPER_SES : ses modeli (varsayılan tr_TR-fahrettin-medium)
 TEST_SES=1 ise ses yerine sessizlik üretir (yerel deneme için).
 """
 import base64
@@ -70,11 +74,90 @@ def ssml(cumleler):
     return '<speak>' + parca + '<mark name="son"/></speak>'
 
 
+PIPER_SESLER = ['tr_TR-fahrettin-medium', 'tr_TR-fettah-medium', 'tr_TR-dfki-medium']
+PIPER_ARA = 0.28        # cümleler arası sessizlik (sn)
+
+
+def motor():
+    if os.environ.get('TEST_SES') == '1':
+        return 'test'
+    return 'google' if os.environ.get('GCP_TTS_KEY') else 'piper'
+
+
+def piper_model(klasor, ad):
+    """Ses modelini (yoksa) Hugging Face'teki resmî Piper ses deposundan indirir."""
+    m = re.match(r'^([a-z]{2})_([A-Z]{2})-([a-z0-9_]+)-(x_low|low|medium|high)$', ad)
+    if not m:
+        raise RuntimeError('Geçersiz Piper ses adı: ' + ad)
+    os.makedirs(klasor, exist_ok=True)
+    yol = os.path.join(klasor, ad + '.onnx')
+    temel = 'https://huggingface.co/rhasspy/piper-voices/resolve/main/%s/%s_%s/%s/%s/%s' % (
+        m.group(1), m.group(1), m.group(2), m.group(3), m.group(4), ad)
+    for uz in ('.onnx.json', '.onnx'):
+        hedef = yol[:-5] + uz
+        if os.path.exists(hedef) and os.path.getsize(hedef) > 1000:
+            continue
+        son = None
+        for i in range(3):
+            try:
+                istek = urllib.request.Request(temel + uz, headers={'User-Agent': 'MansetMasasi video'})
+                with urllib.request.urlopen(istek, timeout=120) as y, open(hedef + '.tmp', 'wb') as f:
+                    f.write(y.read())
+                os.replace(hedef + '.tmp', hedef)
+                son = None
+                break
+            except Exception as e:  # noqa: BLE001
+                son = e
+                time.sleep(3 * (i + 1))
+        if son:
+            raise RuntimeError('Piper sesi indirilemedi (%s): %s' % (ad, son))
+    return yol
+
+
+def piper_seslendir(cumleler, hiz, yol):
+    """Her cümleyi ayrı okutur, aralarına kısa sessizlik koyup birleştirir. Cümle zamanları kesin bilinir."""
+    kok = os.environ.get('PIPER_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'piper'))
+    program = os.path.join(kok, 'piper')
+    if not os.path.exists(program):
+        raise RuntimeError('Piper bulunamadı (%s). İş akışı dosyası (video.yml) güncel mi?' % program)
+    istenen = os.environ.get('PIPER_SES') or PIPER_SESLER[0]
+    adaylar = [istenen] + [s for s in PIPER_SESLER if s != istenen]
+    model, son = None, None
+    for ad in adaylar:
+        try:
+            model = piper_model(os.path.join(kok, 'sesler'), ad)
+            break
+        except Exception as e:  # noqa: BLE001
+            son = e
+    if not model:
+        raise RuntimeError(str(son))
+    klasor = os.path.dirname(os.path.abspath(yol))
+    parcalar, baslar, t = [], [], 0.0
+    for i, c in enumerate(cumleler):
+        p = os.path.join(klasor, 'p%02d.wav' % i)
+        r = subprocess.run([program, '--model', model, '--output_file', p, '--length_scale', '%.3f' % (1.0 / hiz),
+                            '--sentence_silence', '0', '--quiet'],
+                           input=c.strip() + '\n', stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0 or not os.path.exists(p) or os.path.getsize(p) < 100:
+            raise RuntimeError('Piper seslendiremedi: ' + (r.stderr or '')[-400:])
+        baslar.append(round(t, 3))
+        t += sure(p) + PIPER_ARA
+        parcalar.append(p)
+    girdiler, filtre = [], ''
+    for i, p in enumerate(parcalar):
+        girdiler += ['-i', p]
+        filtre += '[%d:a]aresample=48000,apad=pad_dur=%.2f[a%d];' % (i, PIPER_ARA, i)
+    filtre += ''.join('[a%d]' % i for i in range(len(parcalar))) + 'concat=n=%d:v=0:a=1,loudnorm=I=-16:TP=-1.5:LRA=11[s]' % len(parcalar)
+    calistir(['ffmpeg', '-y', '-v', 'error'] + girdiler + ['-filter_complex', filtre, '-map', '[s]',
+              '-ar', '48000', '-ac', '2', '-c:a', 'pcm_s16le', yol])
+    return baslar
+
+
 def seslendir(cumleler, ses, hiz, yol):
     """WAV üretir; her cümlenin başlangıç saniyesini döndürür (bilinmiyorsa None)."""
-    if os.environ.get('TEST_SES') == '1' or not os.environ.get('GCP_TTS_KEY'):
-        if os.environ.get('TEST_SES') != '1':
-            raise RuntimeError('GCP_TTS_KEY tanımlı değil (GitHub → Settings → Secrets → Actions).')
+    if motor() == 'piper':
+        return piper_seslendir(cumleler, hiz, yol)
+    if motor() == 'test':
         toplam = sum(max(1.2, len(c) * 0.065) for c in cumleler)
         calistir(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '%.2f' % toplam, yol])
         return None
@@ -260,8 +343,9 @@ def uret(p, klasor, cikti_klasor):
     if boyut > 19.5 * 1024 * 1024:
         raise RuntimeError('Video 20 MB sınırını aşıyor (%.1f MB).' % (boyut / 1048576))
     return {'ok': True, 'id': vid, 'sure': toplam, 'boyut': boyut, 'cumle': len(cumleler),
-            'karakter': sum(len(c) for c in cumleler), 'zaman': int(time.time()),
-            'zamanlama': 'tts' if os.environ.get('GCP_TTS_KEY') and os.environ.get('TEST_SES') != '1' else 'test',
+            # Google ücretli olabilir → karakter sayılır; Piper ücretsiz → 0 (panel harcama yazmaz)
+            'karakter': sum(len(c) for c in cumleler) if motor() == 'google' else 0, 'zaman': int(time.time()),
+            'zamanlama': {'google': 'tts', 'piper': 'piper'}.get(motor(), 'test'), 'motor': motor(),
             'arkaplan': bool(zemin)}
 
 

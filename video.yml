@@ -1,0 +1,111 @@
+# Manşet Masası — video üretimi ve yayını
+# Apps Script bu depoya "video" olayı gönderir → bu iş videoyu üretir → GitHub Pages'te yayımlar.
+# Videolar 3 gün tutulur (platformlar o sürede indirip kendi sunucularına alır), sonra silinir.
+name: video
+
+on:
+  repository_dispatch:
+    types: [video]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# Aynı anda tek iş: iki video aynı anda yayımlanıp birbirini silmesin.
+concurrency:
+  group: yayin
+  cancel-in-progress: false
+
+jobs:
+  uret:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Araçlar
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg > /dev/null
+          mkdir -p yazi
+          for f in BarlowCondensed-Bold BarlowCondensed-SemiBold BarlowCondensed-Regular; do
+            curl -sSfL -o yazi/$f.ttf "https://github.com/google/fonts/raw/main/ofl/barlowcondensed/$f.ttf" || true
+          done
+
+      - name: Önceki videoları al
+        run: |
+          mkdir -p site/v
+          if git ls-remote --exit-code --heads origin depo > /dev/null 2>&1; then
+            git fetch -q --depth=1 origin depo
+            git --work-tree=site checkout FETCH_HEAD -- .
+            git reset -q
+          fi
+
+      # Ücretsiz seslendirme (Piper, açık kaynak). GCP_TTS_KEY eklenirse Google sesi kullanılır.
+      - uses: actions/cache@v4
+        if: github.event_name == 'repository_dispatch'
+        with:
+          path: ${{ runner.temp }}/piper
+          key: piper-2023.11.14-2-v1
+
+      - name: Ücretsiz ses (Piper)
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          if [ ! -x "$RUNNER_TEMP/piper/piper" ]; then
+            curl -sSfL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz | tar xz -C "$RUNNER_TEMP"
+          fi
+          "$RUNNER_TEMP/piper/piper" --help > /dev/null 2>&1 && echo "Piper hazır"
+
+      - name: Videoyu üret
+        if: github.event_name == 'repository_dispatch'
+        env:
+          # Boşsa ücretsiz Piper sesi kullanılır
+          GCP_TTS_KEY: ${{ secrets.GCP_TTS_KEY }}
+          PIPER_DIR: ${{ runner.temp }}/piper
+          PIPER_SES: tr_TR-fahrettin-medium
+          # Yalnızca senin bota gönderdiğin videoyu indirmek için (Telegram bot anahtarı)
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          YAZI_KLASORU: ${{ github.workspace }}/yazi
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          printf '%s' "$PAYLOAD" > /tmp/payload.json
+          python3 render.py /tmp/payload.json site/v
+
+      - name: 3 günden eski videoları sil
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, time
+          sinir = time.time() - 3 * 86400
+          for j in glob.glob('site/v/*.json'):
+              try:
+                  z = json.load(open(j)).get('zaman', 0)
+              except Exception:
+                  z = 0
+              if z < sinir:
+                  for uz in ('.json', '.mp4', '.jpg'):
+                      p = j[:-5] + uz
+                      if os.path.exists(p):
+                          os.remove(p)
+          PY
+          printf '<!doctype html><meta charset="utf-8"><title>Manşet Masası</title><p>Video deposu.</p>' > site/index.html
+          touch site/.nojekyll
+
+      - name: Depo dalına kaydet
+        run: |
+          cd site
+          git init -q
+          git checkout -q -b depo
+          git add -A
+          git -c user.name="manset-bot" -c user.email="manset-bot@users.noreply.github.com" commit -qm "videolar $(date -u +%FT%TZ)"
+          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" depo
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
