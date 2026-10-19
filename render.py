@@ -16,8 +16,9 @@ Girdi: GitHub repository_dispatch ile gelen JSON (payload.json).
   <id>.jpg   kapak
   <id>.json  {"ok": true, "sure": 27.4, ...}  ya da  {"ok": false, "hata": "..."}
 
-SESLENDIRME=sessiz ise seslendirme yapılmaz: cümleler okuma hızına göre ekranda akar,
-  altta telifsiz, programla üretilmiş hafif bir fon sesi çalar (FON=0 ise tam sessiz).
+SESLENDIRME=sessiz ise seslendirme yapılmaz: cümleler okuma hızına göre ekranda akar, altta fon müziği çalar:
+  depodaki muzik/ klasöründe .mp3/.m4a/.ogg/.wav varsa onlardan biri (Pixabay Music vb. telifsiz parçalar),
+  yoksa programla üretilmiş hafif bir akor. FON=0 ise tam sessiz.
 Seslendirme (ilk bulunan kullanılır):
   AZURE_TTS_KEY varsa Microsoft Azure Speech (ücretsiz F0 paketi: ayda 500 bin karakter, doğal sinirsel ses).
     AZURE_TTS_REGION : Azure kaynağının bölgesi (örn. westeurope)
@@ -221,6 +222,18 @@ def okuma_suresi(cumle):
     return max(2.4, len(cumle.split()) * 0.40 + 0.7)
 
 
+def muzik_sec(cumleler):
+    """muzik/ klasöründen bir parça seçer (habere göre sabit, videolar arasında değişir)."""
+    klasor = os.environ.get('MUZIK_KLASORU') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'muzik')
+    if not os.path.isdir(klasor):
+        return None
+    parcalar = sorted(f for f in os.listdir(klasor) if f.lower().endswith(('.mp3', '.m4a', '.ogg', '.wav', '.aac')))
+    if not parcalar:
+        return None
+    sira = sum(ord(ch) for ch in ''.join(cumleler)) % len(parcalar)
+    return os.path.join(klasor, parcalar[sira])
+
+
 def sessiz_ses(cumleler, yol):
     """Seslendirmesiz video: cümle zamanlarını okuma hızından çıkarır, hafif bir fon sesi üretir."""
     baslar, t = [], 0.4
@@ -231,6 +244,16 @@ def sessiz_ses(cumleler, yol):
     if os.environ.get('FON', '1') == '0':
         calistir(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '%.2f' % toplam, yol])
         return baslar
+    parca = muzik_sec(cumleler)
+    if parca:
+        try:
+            calistir(['ffmpeg', '-y', '-v', 'error', '-stream_loop', '-1', '-i', parca, '-t', '%.2f' % toplam,
+                      '-af', 'loudnorm=I=-20:TP=-3:LRA=11,afade=t=in:d=1,afade=t=out:st=%.2f:d=2' % max(0.1, toplam - 2),
+                      '-ar', '48000', '-ac', '2', '-c:a', 'pcm_s16le', yol])
+            print('Fon müziği:', os.path.basename(parca))
+            return baslar
+        except Exception as e:  # noqa: BLE001
+            print('Müzik kullanılamadı, üretilmiş fon sesine geçiliyor:', e)
     # Telifsiz: tamamen formülle üretilen yumuşak bir akor (La minör), yavaş dalgalanır.
     ifade = ('0.10*sin(2*PI*110*t)*(0.65+0.35*sin(2*PI*0.11*t))'
              '+0.07*sin(2*PI*164.81*t)*(0.6+0.4*sin(2*PI*0.07*t+1))'
@@ -399,13 +422,14 @@ def uret(p, klasor, cikti_klasor):
     kart = os.path.join(klasor, 'kart.mp4')
     calistir(['ffmpeg', '-y', '-v', 'error', '-f', 'concat', '-safe', '0', '-i', liste, '-c', 'copy', kart])
 
-    # İsteğe bağlı: Pexels'ten habere uygun temsilî arka plan görüntüleri (yoksa düz lacivert zemin)
+    # İsteğe bağlı: Pixabay ya da Pexels'ten habere uygun temsilî arka plan görüntüleri (yoksa düz lacivert zemin)
     zemin = arka_plan(p.get('arkaplan') or [], sinirlar, toplam, klasor)
     ses_notu = '' if motor() == 'sessiz' else ' · Seslendirme: yapay zekâ'
     not_metni = 'Kaynaklar açıklamada' + ses_notu
     if zemin:
         kredi = [k for k in (p.get('kredi') or []) if k][:2]
-        not_metni = 'Temsilî görüntü: Pexels' + (' / ' + ', '.join(kredi) if kredi else '') + ses_notu
+        kaynak_adi = re.sub(r'[^A-Za-z]', '', str(p.get('kaynakAdi') or 'Pexels'))[:20] or 'Pexels'
+        not_metni = 'Temsilî görüntü: ' + kaynak_adi + (' / ' + ', '.join(kredi) if kredi else '') + ses_notu
 
     ass = os.path.join(klasor, 'altyazi.ass')
     ass_yaz(ass, cumleler, baslar, toplam, str(p.get('kanal') or ''), str(p.get('kategori') or 'gündem'), not_metni)
